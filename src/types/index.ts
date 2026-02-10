@@ -1,4 +1,3 @@
-import type { Decimal } from 'decimal.js';
 import type {
   Position,
   PositionBatch,
@@ -6,6 +5,9 @@ import type {
   PositionStatus,
   BatchStatus,
 } from '@prisma/client';
+import { Decimal } from '../utils/constants.js';
+
+type DecimalType = InstanceType<typeof Decimal>;
 
 // Re-export Prisma types
 export type { Position, PositionBatch, SellMode, PositionStatus, BatchStatus };
@@ -13,24 +15,24 @@ export type { Position, PositionBatch, SellMode, PositionStatus, BatchStatus };
 // Input types
 export interface CreatePositionInput {
   symbol: string;
-  quantity: Decimal;
-  entryPrice: Decimal;
-  investedAmount: Decimal;
+  quantity: DecimalType;
+  entryPrice: DecimalType;
+  investedAmount: DecimalType;
 }
 
 export interface CreateBatchInput {
   symbol: string;
   sellMode: SellMode;
-  initialPrice: Decimal;
+  initialPrice: DecimalType;
 }
 
 // Result types
 export interface TradeResult {
   success: boolean;
   orderId?: string;
-  executedPrice?: Decimal;
-  executedQuantity?: Decimal;
-  fee?: Decimal;
+  executedPrice?: DecimalType;
+  executedQuantity?: DecimalType;
+  fee?: DecimalType;
   error?: string;
 }
 
@@ -40,20 +42,20 @@ export interface BatchSummary {
   sellMode: SellMode;
   status: BatchStatus;
   positionCount: number;
-  totalInvested: Decimal;
-  totalQuantity: Decimal;
-  averagePrice: Decimal;
-  nextBuyPrice: Decimal;
-  targetSellPrice: Decimal;
-  currentPrice?: Decimal;
-  currentPnL?: Decimal;
-  currentPnLPercent?: Decimal;
+  totalInvested: DecimalType;
+  totalQuantity: DecimalType;
+  averagePrice: DecimalType;
+  nextBuyPrice: DecimalType;
+  targetSellPrice: DecimalType;
+  currentPrice?: DecimalType;
+  currentPnL?: DecimalType;
+  currentPnLPercent?: DecimalType;
 }
 
 export interface PositionWithTarget extends Position {
-  targetPrice: Decimal;
-  currentPnL?: Decimal;
-  currentPnLPercent?: Decimal;
+  targetPrice: DecimalType;
+  currentPnL?: DecimalType;
+  currentPnLPercent?: DecimalType;
 }
 
 // Order types
@@ -85,9 +87,9 @@ export interface OrderResult {
 
 // Strategy types
 export interface TickContext {
-  currentPrice: Decimal;
+  currentPrice: DecimalType;
   batch: PositionBatch | null;
-  availableBalance: Decimal;
+  availableBalance: DecimalType;
   timestamp: Date;
 }
 
@@ -95,7 +97,7 @@ export interface StrategyDecision {
   action: 'BUY' | 'SELL' | 'HOLD';
   reason: string;
   params?: {
-    amount?: Decimal;
+    amount?: DecimalType;
     positions?: Position[];
   };
 }

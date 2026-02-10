@@ -1,10 +1,12 @@
-import Decimal from 'decimal.js';
 import { config } from '../config/index.js';
 import { createChildLogger } from '../utils/logger.js';
+import { Decimal } from '../utils/constants.js';
 import { exchangeService } from '../services/exchange.service.js';
 import { capitalManager } from '../services/capital-manager.service.js';
 import { positionManager } from '../services/position-manager.service.js';
-import type { PositionBatch, SellMode } from '../types/index.js';
+import type { Position, PositionBatch, SellMode } from '../types/index.js';
+
+type DecimalType = InstanceType<typeof Decimal>;
 
 const logger = createChildLogger({ service: 'DCAStrategy' });
 
@@ -82,7 +84,7 @@ export class DCAStrategy {
   /**
    * Inicializa um novo batch
    */
-  private async initializeBatch(currentPrice: Decimal): Promise<PositionBatch> {
+  private async initializeBatch(currentPrice: DecimalType): Promise<PositionBatch> {
     logger.info(
       { symbol: this.symbol, sellMode: this.sellMode },
       'Initializing new batch'
@@ -96,7 +98,7 @@ export class DCAStrategy {
    */
   private async executeBuy(
     batch: PositionBatch,
-    currentPrice: Decimal,
+    currentPrice: DecimalType,
     reason: string
   ): Promise<void> {
     // Validar se pode comprar
@@ -178,8 +180,8 @@ export class DCAStrategy {
    */
   private async executeSell(
     batch: PositionBatch,
-    currentPrice: Decimal,
-    positionsToSell: PositionBatch['positions']
+    currentPrice: DecimalType,
+    positionsToSell: Position[]
   ): Promise<void> {
     // Calcular quantidade total a vender
     let totalQuantity = new Decimal(0);
@@ -257,7 +259,7 @@ export class DCAStrategy {
   /**
    * Log de status do tick
    */
-  private async logStatus(batch: PositionBatch, currentPrice: Decimal): Promise<void> {
+  private async logStatus(batch: PositionBatch, currentPrice: DecimalType): Promise<void> {
     const summary = await positionManager.getBatchSummary(batch.id, currentPrice);
 
     if (!summary) return;

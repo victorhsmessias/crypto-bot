@@ -1,9 +1,10 @@
 import ccxt, { type Exchange, type Ticker, type Order, type Balances } from 'ccxt';
-import Decimal from 'decimal.js';
 import { config } from '../config/index.js';
 import { createChildLogger } from '../utils/logger.js';
-import { EXCHANGE } from '../utils/constants.js';
+import { Decimal, EXCHANGE } from '../utils/constants.js';
 import type { OrderResult } from '../types/index.js';
+
+type DecimalType = InstanceType<typeof Decimal>;
 
 const logger = createChildLogger({ service: 'ExchangeService' });
 
@@ -43,7 +44,7 @@ export class ExchangeService {
     }
   }
 
-  async getCurrentPrice(symbol: string): Promise<Decimal> {
+  async getCurrentPrice(symbol: string): Promise<DecimalType> {
     try {
       const ticker: Ticker = await this.exchange.fetchTicker(symbol);
 
@@ -61,7 +62,7 @@ export class ExchangeService {
     }
   }
 
-  async getBalance(currency: string = 'USDT'): Promise<Decimal> {
+  async getBalance(currency: string = 'USDT'): Promise<DecimalType> {
     try {
       const balances: Balances = await this.exchange.fetchBalance();
       const free = balances[currency]?.free ?? 0;
@@ -165,7 +166,7 @@ export class ExchangeService {
     }
   }
 
-  async getMinOrderSize(symbol: string): Promise<Decimal> {
+  async getMinOrderSize(symbol: string): Promise<DecimalType> {
     try {
       const market = this.exchange.market(symbol);
       const minCost = market.limits?.cost?.min ?? 10;
@@ -181,17 +182,17 @@ export class ExchangeService {
       id: order.id,
       symbol: order.symbol,
       side: order.side as 'buy' | 'sell',
-      type: order.type,
-      status: order.status,
+      type: order.type ?? 'market',
+      status: order.status ?? 'closed',
       price: order.average ?? order.price ?? 0,
-      amount: order.amount,
-      filled: order.filled,
-      remaining: order.remaining,
-      cost: order.cost,
+      amount: order.amount ?? 0,
+      filled: order.filled ?? 0,
+      remaining: order.remaining ?? 0,
+      cost: order.cost ?? 0,
       fee: order.fee
-        ? { cost: order.fee.cost, currency: order.fee.currency }
+        ? { cost: order.fee.cost ?? 0, currency: order.fee.currency ?? '' }
         : undefined,
-      timestamp: order.timestamp,
+      timestamp: order.timestamp ?? Date.now(),
     };
   }
 

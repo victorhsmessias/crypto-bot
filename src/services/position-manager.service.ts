@@ -1,8 +1,7 @@
-import Decimal from 'decimal.js';
 import { prisma } from '../lib/prisma.js';
 import { config } from '../config/index.js';
 import { createChildLogger } from '../utils/logger.js';
-import { TRADING } from '../utils/constants.js';
+import { Decimal, TRADING } from '../utils/constants.js';
 import type {
   Position,
   PositionBatch,
@@ -11,6 +10,8 @@ import type {
   BatchSummary,
   SellCheckResult,
 } from '../types/index.js';
+
+type DecimalType = InstanceType<typeof Decimal>;
 
 const logger = createChildLogger({ service: 'PositionManager' });
 
@@ -35,7 +36,7 @@ export class PositionManagerService {
   async createBatch(
     symbol: string,
     sellMode: SellMode,
-    initialPrice: Decimal
+    initialPrice: DecimalType
   ): Promise<PositionBatch> {
     const nextBuyPrice = initialPrice; // Primeira compra imediata
     const targetSellPrice = initialPrice.times(TRADING.SELL_TARGET_MULTIPLIER);
@@ -114,7 +115,7 @@ export class PositionManagerService {
   private async recalculateBatchInTransaction(
     tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
     batchId: string,
-    lastEntryPrice: Decimal
+    lastEntryPrice: DecimalType
   ): Promise<void> {
     const openPositions = await tx.position.findMany({
       where: { batchId, status: 'OPEN' },
@@ -199,7 +200,7 @@ export class PositionManagerService {
    */
   async checkSellCondition(
     batch: PositionBatch,
-    currentPrice: Decimal
+    currentPrice: DecimalType
   ): Promise<SellCheckResult> {
     const sellMode = batch.sellMode;
 
@@ -220,7 +221,7 @@ export class PositionManagerService {
    */
   private async checkBatchSell(
     batch: PositionBatch,
-    currentPrice: Decimal
+    currentPrice: DecimalType
   ): Promise<SellCheckResult> {
     const targetPrice = new Decimal(batch.targetSellPrice.toString());
 
@@ -255,7 +256,7 @@ export class PositionManagerService {
    */
   private async checkIndividualSell(
     batch: PositionBatch,
-    currentPrice: Decimal
+    currentPrice: DecimalType
   ): Promise<SellCheckResult> {
     const positions = await prisma.position.findMany({
       where: { batchId: batch.id, status: 'OPEN' },
@@ -307,7 +308,7 @@ export class PositionManagerService {
    */
   private async checkHybridSell(
     batch: PositionBatch,
-    currentPrice: Decimal
+    currentPrice: DecimalType
   ): Promise<SellCheckResult> {
     // Passo 1: Verificar se há posições individuais prontas
     const individualResult = await this.checkIndividualSell(batch, currentPrice);
@@ -325,7 +326,7 @@ export class PositionManagerService {
    */
   async closePositions(
     positions: Position[],
-    exitPrice: Decimal,
+    exitPrice: DecimalType,
     exitOrderId?: string
   ): Promise<void> {
     const profitTarget = new Decimal(config.DCA_PROFIT_TARGET);
@@ -396,7 +397,7 @@ export class PositionManagerService {
   /**
    * Obtém resumo do batch atual
    */
-  async getBatchSummary(batchId: string, currentPrice?: Decimal): Promise<BatchSummary | null> {
+  async getBatchSummary(batchId: string, currentPrice?: DecimalType): Promise<BatchSummary | null> {
     const batch = await prisma.positionBatch.findUnique({
       where: { id: batchId },
       include: { positions: { where: { status: 'OPEN' } } },
@@ -408,8 +409,8 @@ export class PositionManagerService {
     const totalQuantity = new Decimal(batch.totalQuantity.toString());
     const averagePrice = new Decimal(batch.averagePrice.toString());
 
-    let currentPnL: Decimal | undefined;
-    let currentPnLPercent: Decimal | undefined;
+    let currentPnL: DecimalType | undefined;
+    let currentPnLPercent: DecimalType | undefined;
 
     if (currentPrice && totalQuantity.greaterThan(0)) {
       const currentValue = totalQuantity.times(currentPrice);
@@ -440,9 +441,9 @@ export class PositionManagerService {
   async logTrade(
     symbol: string,
     side: 'buy' | 'sell',
-    quantity: Decimal,
-    price: Decimal,
-    cost: Decimal,
+    quantity: DecimalType,
+    price: DecimalType,
+    cost: DecimalType,
     context: {
       batchId?: string;
       positionId?: string;

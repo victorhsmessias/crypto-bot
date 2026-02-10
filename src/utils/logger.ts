@@ -1,4 +1,7 @@
-import pino from 'pino';
+import pinoModule from 'pino';
+
+// Fix ESM import
+const pino = (pinoModule as unknown as { default: typeof pinoModule }).default || pinoModule;
 
 const isDevelopment = process.env.NODE_ENV !== 'production';
 

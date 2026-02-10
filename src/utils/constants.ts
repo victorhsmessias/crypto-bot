@@ -1,7 +1,12 @@
-import Decimal from 'decimal.js';
+import DecimalJS from 'decimal.js';
+
+// Fix ESM import
+const Decimal = (DecimalJS as unknown as { default: typeof DecimalJS }).default || DecimalJS;
 
 // Configurar precisão do Decimal.js
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
+
+export { Decimal };
 
 export const TRADING = {
   // Percentuais padrão (podem ser sobrescritos pelo config)

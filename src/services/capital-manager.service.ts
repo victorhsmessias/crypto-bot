@@ -1,8 +1,9 @@
-import Decimal from 'decimal.js';
 import { config } from '../config/index.js';
 import { createChildLogger } from '../utils/logger.js';
-import { TRADING } from '../utils/constants.js';
+import { Decimal, TRADING } from '../utils/constants.js';
 import { exchangeService } from './exchange.service.js';
+
+type DecimalType = InstanceType<typeof Decimal>;
 
 const logger = createChildLogger({ service: 'CapitalManager' });
 
@@ -17,7 +18,7 @@ export class CapitalManagerService {
   /**
    * Obtém o saldo disponível na exchange
    */
-  async getAvailableBalance(): Promise<Decimal> {
+  async getAvailableBalance(): Promise<DecimalType> {
     const balance = await exchangeService.getBalance(this.quoteCurrency);
     logger.debug({ balance: balance.toString() }, 'Available balance');
     return balance;
@@ -27,7 +28,7 @@ export class CapitalManagerService {
    * Calcula o tamanho da posição baseado no percentual configurado
    * positionSize = balance * DCA_POSITION_SIZE (default 10%)
    */
-  async calculatePositionSize(): Promise<Decimal> {
+  async calculatePositionSize(): Promise<DecimalType> {
     const balance = await this.getAvailableBalance();
     const positionSizePercent = new Decimal(config.DCA_POSITION_SIZE);
 
@@ -48,7 +49,7 @@ export class CapitalManagerService {
   /**
    * Valida se há saldo suficiente para a ordem
    */
-  async validateSufficientBalance(requiredAmount: Decimal): Promise<boolean> {
+  async validateSufficientBalance(requiredAmount: DecimalType): Promise<boolean> {
     const balance = await this.getAvailableBalance();
     const hasSufficient = balance.greaterThanOrEqualTo(requiredAmount);
 
@@ -68,7 +69,7 @@ export class CapitalManagerService {
   /**
    * Valida se o valor da ordem atende ao mínimo da exchange
    */
-  async validateMinOrderSize(orderValue: Decimal): Promise<boolean> {
+  async validateMinOrderSize(orderValue: DecimalType): Promise<boolean> {
     const minOrderSize = await exchangeService.getMinOrderSize(config.TRADING_SYMBOL);
     const isValid = orderValue.greaterThanOrEqualTo(minOrderSize);
 
@@ -88,7 +89,7 @@ export class CapitalManagerService {
   /**
    * Valida todas as condições para uma compra
    */
-  async canExecuteBuy(): Promise<{ canBuy: boolean; reason?: string; amount?: Decimal }> {
+  async canExecuteBuy(): Promise<{ canBuy: boolean; reason?: string; amount?: DecimalType }> {
     const positionSize = await this.calculatePositionSize();
 
     // Verificar mínimo da exchange
@@ -118,7 +119,7 @@ export class CapitalManagerService {
   /**
    * Formata valor para exibição
    */
-  formatCurrency(value: Decimal): string {
+  formatCurrency(value: DecimalType): string {
     return `${value.toFixed(2)} ${this.quoteCurrency}`;
   }
 }
