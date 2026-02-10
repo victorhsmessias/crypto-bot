@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum SellMode {
+  BATCH      // Vende todas posições juntas
+  INDIVIDUAL // Cada posição com seu target
+  HYBRID     // Combina ambos
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+}
+
+enum BatchStatus {
+  ACTIVE
+  COMPLETED
+}
+
+// ============================================
+// MODELS
+// ============================================
+
+/// Agrupa posições para cálculo de preço médio ponderado
+model PositionBatch {
+  id              String      @id @default(cuid())
+  symbol          String      // Ex: "BTC/USDT"
+  sellMode        SellMode    @default(BATCH)
+  status          BatchStatus @default(ACTIVE)
+
+  // Valores agregados (recalculados após cada operação)
+  totalQuantity   Decimal     @db.Decimal(18, 8)  @default(0)
+  totalInvested   Decimal     @db.Decimal(18, 2)  @default(0)
+  averagePrice    Decimal     @db.Decimal(18, 8)  @default(0)
+
+  // Triggers de compra/venda
+  nextBuyPrice    Decimal     @db.Decimal(18, 8)  @default(0)  // lastPrice * 0.97
+  targetSellPrice Decimal     @db.Decimal(18, 8)  @default(0)  // averagePrice * 1.03
+
+  // Relacionamentos
+  positions       Position[]
+
+  // Timestamps
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  closedAt        DateTime?
+
+  @@index([symbol, status])
+  @@index([status])
+}
+
+/// Representa uma compra individual dentro de um batch
+model Position {
+  id              String         @id @default(cuid())
+  symbol          String         // Ex: "BTC/USDT"
+  side            String         @default("buy")
+  quantity        Decimal        @db.Decimal(18, 8)
+  entryPrice      Decimal        @db.Decimal(18, 8)
+  investedAmount  Decimal        @db.Decimal(18, 2)
+  status          PositionStatus @default(OPEN)
+
+  // Exchange order info
+  orderId         String?
+  fee             Decimal?       @db.Decimal(18, 8)
+  feeCurrency     String?
+
+  // Relacionamento com batch
+  batchId         String
+  batch           PositionBatch  @relation(fields: [batchId], references: [id])
+
+  // Dados de fechamento (preenchidos quando vendido)
+  exitPrice       Decimal?       @db.Decimal(18, 8)
+  exitOrderId     String?
+  profit          Decimal?       @db.Decimal(18, 2)
+  profitPercent   Decimal?       @db.Decimal(8, 4)
+
+  // Timestamps
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  closedAt        DateTime?
+
+  @@index([batchId, status])
+  @@index([symbol, status])
+  @@index([status])
+}
+
+/// Registro de todas as operações para auditoria
+model TradeLog {
+  id              String   @id @default(cuid())
+  symbol          String
+  side            String   // "buy" ou "sell"
+  quantity        Decimal  @db.Decimal(18, 8)
+  price           Decimal  @db.Decimal(18, 8)
+  cost            Decimal  @db.Decimal(18, 2)
+  orderId         String?
+
+  // Contexto
+  batchId         String?
+  positionId      String?
+  reason          String?  // "DCA_BUY", "BATCH_SELL", "INDIVIDUAL_SELL", etc.
+
+  // Exchange response
+  rawResponse     Json?
+
+  createdAt       DateTime @default(now())
+
+  @@index([symbol])
+  @@index([createdAt])
+}
