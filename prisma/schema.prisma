@@ -11,109 +11,237 @@ datasource db {
 // ENUMS
 // ============================================
 
-enum SellMode {
-  BATCH      // Vende todas posições juntas
-  INDIVIDUAL // Cada posição com seu target
-  HYBRID     // Combina ambos
+enum CycleStatus {
+  SEARCHING
+  ACTIVE
+  PARTIAL_SELL
+  TRAILING
+  COMPLETED
+  PAUSED
 }
 
 enum PositionStatus {
   OPEN
+  PARTIALLY_CLOSED
   CLOSED
 }
 
-enum BatchStatus {
-  ACTIVE
-  COMPLETED
+enum BotStateType {
+  RUNNING
+  PAUSED_DRAWDOWN
+  PAUSED_LATERAL
+  PAUSED_CRASH
+  PAUSED_MANUAL
+}
+
+enum NotificationType {
+  CYCLE_START
+  CYCLE_END
+  BUY
+  SELL
+  PARTIAL_SELL
+  TRAILING_TRIGGERED
+  DRAWDOWN_WARNING
+  BOT_PAUSED
+  BOT_RESUMED
+  CRASH_DETECTED
+  LATERAL_DETECTED
+  ERROR
 }
 
 // ============================================
 // MODELS
 // ============================================
 
-/// Agrupa posições para cálculo de preço médio ponderado
-model PositionBatch {
-  id              String      @id @default(cuid())
-  symbol          String      // Ex: "BTC/USDT"
-  sellMode        SellMode    @default(BATCH)
-  status          BatchStatus @default(ACTIVE)
+/// Estado global do bot e por simbolo
+model BotState {
+  id                            String       @id @default(cuid())
+  symbol                        String?      // null = estado global
+  state                         BotStateType @default(RUNNING)
 
-  // Valores agregados (recalculados após cada operação)
-  totalQuantity   Decimal     @db.Decimal(18, 8)  @default(0)
-  totalInvested   Decimal     @db.Decimal(18, 2)  @default(0)
-  averagePrice    Decimal     @db.Decimal(18, 8)  @default(0)
+  // Drawdown tracking
+  peakBalance                   Decimal      @db.Decimal(18, 2) @default(0)
+  currentBalance                Decimal      @db.Decimal(18, 2) @default(0)
+  maxDrawdownHit                Decimal      @db.Decimal(8, 4)  @default(0)
 
-  // Triggers de compra/venda
-  nextBuyPrice    Decimal     @db.Decimal(18, 8)  @default(0)  // lastPrice * 0.97
-  targetSellPrice Decimal     @db.Decimal(18, 8)  @default(0)  // averagePrice * 1.03
+  // Lateral market detection
+  consecutiveLowProfitCycles    Int          @default(0)
+  pausedUntil                   DateTime?
+
+  // Anti-crash state
+  crashDetectedAt               DateTime?
+  crashSuspendedUntil           DateTime?
+
+  createdAt                     DateTime     @default(now())
+  updatedAt                     DateTime     @updatedAt
+
+  @@unique([symbol])
+  @@index([state])
+}
+
+/// Ciclo de trading (substitui PositionBatch)
+model Cycle {
+  id                String      @id @default(cuid())
+  symbol            String
+  status            CycleStatus @default(SEARCHING)
+
+  // Capital
+  initialBalance    Decimal     @db.Decimal(18, 2) @default(0)
+  maxExposure       Decimal     @db.Decimal(18, 2) @default(0)
+
+  // Valores agregados
+  totalQuantity     Decimal     @db.Decimal(18, 8) @default(0)
+  remainingQuantity Decimal     @db.Decimal(18, 8) @default(0)
+  totalInvested     Decimal     @db.Decimal(18, 2) @default(0)
+  averagePrice      Decimal     @db.Decimal(18, 8) @default(0)
+
+  // Grid (snapshot, pode adaptar com ATR)
+  gridPercent       Decimal     @db.Decimal(8, 4)  @default(0.03)
+  entryPercent      Decimal     @db.Decimal(8, 4)  @default(0.10)
+
+  // DCA tracking
+  buyCount          Int         @default(0)
+  maxBuys           Int         @default(4)
+  nextBuyPrice      Decimal     @db.Decimal(18, 8) @default(0)
+
+  // Exit tracking
+  targetSellPrice   Decimal     @db.Decimal(18, 8) @default(0)
+  partialSellDone   Boolean     @default(false)
+  trailingStopPrice Decimal?    @db.Decimal(18, 8)
+  trailingHighPrice Decimal?    @db.Decimal(18, 8)
+
+  // Snapshot dos indicadores na entrada
+  entryRsi          Decimal?    @db.Decimal(8, 4)
+  entryEma200       Decimal?    @db.Decimal(18, 8)
+  entryAtr          Decimal?    @db.Decimal(18, 8)
+
+  // Resultados
+  totalProfit       Decimal?    @db.Decimal(18, 2)
+  profitPercent     Decimal?    @db.Decimal(8, 4)
 
   // Relacionamentos
-  positions       Position[]
+  positions         Position[]
 
   // Timestamps
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
-  closedAt        DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  closedAt          DateTime?
 
   @@index([symbol, status])
   @@index([status])
 }
 
-/// Representa uma compra individual dentro de um batch
+/// Posicao individual dentro de um ciclo
 model Position {
-  id              String         @id @default(cuid())
-  symbol          String         // Ex: "BTC/USDT"
-  side            String         @default("buy")
-  quantity        Decimal        @db.Decimal(18, 8)
-  entryPrice      Decimal        @db.Decimal(18, 8)
-  investedAmount  Decimal        @db.Decimal(18, 2)
-  status          PositionStatus @default(OPEN)
+  id                String         @id @default(cuid())
+  symbol            String
+  side              String         @default("buy")
+  quantity          Decimal        @db.Decimal(18, 8)
+  remainingQuantity Decimal        @db.Decimal(18, 8)
+  entryPrice        Decimal        @db.Decimal(18, 8)
+  investedAmount    Decimal        @db.Decimal(18, 2)
+  status            PositionStatus @default(OPEN)
 
   // Exchange order info
-  orderId         String?
-  fee             Decimal?       @db.Decimal(18, 8)
-  feeCurrency     String?
+  orderId           String?
+  fee               Decimal?       @db.Decimal(18, 8)
+  feeCurrency       String?
 
-  // Relacionamento com batch
-  batchId         String
-  batch           PositionBatch  @relation(fields: [batchId], references: [id])
+  // Ciclo
+  cycleId           String
+  cycle             Cycle          @relation(fields: [cycleId], references: [id])
+  buyNumber         Int            @default(1)
 
-  // Dados de fechamento (preenchidos quando vendido)
-  exitPrice       Decimal?       @db.Decimal(18, 8)
-  exitOrderId     String?
-  profit          Decimal?       @db.Decimal(18, 2)
-  profitPercent   Decimal?       @db.Decimal(8, 4)
+  // Dados de fechamento
+  exitPrice         Decimal?       @db.Decimal(18, 8)
+  exitOrderId       String?
+  profit            Decimal?       @db.Decimal(18, 2)
+  profitPercent     Decimal?       @db.Decimal(8, 4)
 
   // Timestamps
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
-  closedAt        DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  closedAt          DateTime?
 
-  @@index([batchId, status])
+  @@index([cycleId, status])
   @@index([symbol, status])
   @@index([status])
 }
 
-/// Registro de todas as operações para auditoria
+/// Metricas de performance
+model Metrics {
+  id                String   @id @default(cuid())
+  symbol            String?
+
+  totalCycles       Int      @default(0)
+  winningCycles     Int      @default(0)
+  losingCycles      Int      @default(0)
+  winRate           Decimal  @db.Decimal(8, 4) @default(0)
+
+  totalProfit       Decimal  @db.Decimal(18, 2) @default(0)
+  netProfit         Decimal  @db.Decimal(18, 2) @default(0)
+  maxDrawdown       Decimal  @db.Decimal(8, 4)  @default(0)
+
+  maxExposureHit    Decimal  @db.Decimal(18, 2) @default(0)
+  avgCycleDuration  Int      @default(0)
+
+  createdAt         DateTime @default(now())
+
+  @@index([symbol])
+  @@index([createdAt])
+}
+
+/// Eventos de crash detectados
+model CrashEvent {
+  id                String   @id @default(cuid())
+  symbol            String
+  dropPercent       Decimal  @db.Decimal(8, 4)
+  timeWindowMinutes Int
+  priceAtDetection  Decimal  @db.Decimal(18, 8)
+  rsiAtDetection    Decimal? @db.Decimal(8, 4)
+  resolved          Boolean  @default(false)
+  resolvedAt        DateTime?
+
+  createdAt         DateTime @default(now())
+
+  @@index([symbol, resolved])
+  @@index([createdAt])
+}
+
+/// Log de auditoria de trades
 model TradeLog {
   id              String   @id @default(cuid())
   symbol          String
-  side            String   // "buy" ou "sell"
+  side            String
   quantity        Decimal  @db.Decimal(18, 8)
   price           Decimal  @db.Decimal(18, 8)
   cost            Decimal  @db.Decimal(18, 2)
   orderId         String?
 
-  // Contexto
-  batchId         String?
+  cycleId         String?
   positionId      String?
-  reason          String?  // "DCA_BUY", "BATCH_SELL", "INDIVIDUAL_SELL", etc.
+  reason          String?
 
-  // Exchange response
   rawResponse     Json?
 
   createdAt       DateTime @default(now())
 
   @@index([symbol])
+  @@index([createdAt])
+  @@index([cycleId])
+}
+
+/// Log de notificacoes enviadas
+model NotificationLog {
+  id              String           @id @default(cuid())
+  type            NotificationType
+  symbol          String?
+  message         String
+  sent            Boolean          @default(false)
+  error           String?
+
+  createdAt       DateTime         @default(now())
+
+  @@index([type])
   @@index([createdAt])
 }

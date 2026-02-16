@@ -1,100 +1,113 @@
 import { prisma } from '../lib/prisma.js';
 import { config } from '../config/index.js';
 import { createChildLogger } from '../utils/logger.js';
-import { Decimal, TRADING } from '../utils/constants.js';
+import { Decimal } from '../utils/constants.js';
+import type { Decimal as DecimalType } from '../utils/constants.js';
 import type {
+  Cycle,
   Position,
-  PositionBatch,
-  SellMode,
+  CycleStatus,
+  IndicatorSnapshot,
   CreatePositionInput,
-  BatchSummary,
-  SellCheckResult,
+  CycleSummary,
 } from '../types/index.js';
-
-type DecimalType = InstanceType<typeof Decimal>;
 
 const logger = createChildLogger({ service: 'PositionManager' });
 
 export class PositionManagerService {
   // ============================================
-  // BATCH OPERATIONS
+  // CYCLE OPERATIONS
   // ============================================
 
-  /**
-   * Busca o batch ativo para o símbolo
-   */
-  async getActiveBatch(symbol: string): Promise<PositionBatch | null> {
-    return prisma.positionBatch.findFirst({
-      where: { symbol, status: 'ACTIVE' },
-      include: { positions: { where: { status: 'OPEN' } } },
+  async getActiveCycle(symbol: string): Promise<Cycle | null> {
+    return prisma.cycle.findFirst({
+      where: {
+        symbol,
+        status: { in: ['ACTIVE', 'PARTIAL_SELL', 'TRAILING', 'PAUSED'] },
+      },
+      include: { positions: { where: { status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } } } },
     });
   }
 
-  /**
-   * Cria um novo batch
-   */
-  async createBatch(
+  async createCycle(
     symbol: string,
-    sellMode: SellMode,
-    initialPrice: DecimalType
-  ): Promise<PositionBatch> {
-    const nextBuyPrice = initialPrice; // Primeira compra imediata
-    const targetSellPrice = initialPrice.times(TRADING.SELL_TARGET_MULTIPLIER);
+    totalBalance: DecimalType,
+    indicators: IndicatorSnapshot,
+    gridPercent: number
+  ): Promise<Cycle> {
+    const maxExposure = totalBalance.times(new Decimal(config.CAPITAL_MAX_EXPOSURE));
 
-    const batch = await prisma.positionBatch.create({
+    const cycle = await prisma.cycle.create({
       data: {
         symbol,
-        sellMode,
-        totalQuantity: 0,
-        totalInvested: 0,
-        averagePrice: 0,
-        nextBuyPrice: nextBuyPrice.toNumber(),
-        targetSellPrice: targetSellPrice.toNumber(),
+        status: 'ACTIVE',
+        initialBalance: totalBalance.toNumber(),
+        maxExposure: maxExposure.toNumber(),
+        gridPercent,
+        entryPercent: config.CAPITAL_ENTRY_PERCENT,
+        maxBuys: config.GRID_MAX_BUYS,
+        entryRsi: indicators.rsi15m ?? indicators.rsi1h ?? undefined,
+        entryEma200: indicators.ema200_4h ?? undefined,
+        entryAtr: indicators.atr14_4h ?? undefined,
       },
     });
 
     logger.info(
       {
-        batchId: batch.id,
+        cycleId: cycle.id,
         symbol,
-        sellMode,
-        nextBuyPrice: nextBuyPrice.toString(),
+        maxExposure: maxExposure.toString(),
+        gridPercent,
       },
-      'New batch created'
+      'New cycle created'
     );
 
-    return batch;
+    return cycle;
   }
 
-  /**
-   * Adiciona uma posição ao batch e recalcula médias
-   */
+  async updateCycleStatus(cycleId: string, status: CycleStatus): Promise<void> {
+    await prisma.cycle.update({
+      where: { id: cycleId },
+      data: {
+        status,
+        ...(status === 'COMPLETED' ? { closedAt: new Date() } : {}),
+      },
+    });
+    logger.info({ cycleId, status }, 'Cycle status updated');
+  }
+
+  // ============================================
+  // POSITION OPERATIONS
+  // ============================================
+
   async addPosition(
-    batchId: string,
+    cycleId: string,
     input: CreatePositionInput,
     orderId?: string,
     fee?: { cost: number; currency: string }
   ): Promise<Position> {
     return prisma.$transaction(async (tx) => {
-      // 1. Criar position
       const position = await tx.position.create({
         data: {
           symbol: input.symbol,
           side: 'buy',
           quantity: input.quantity.toNumber(),
+          remainingQuantity: input.quantity.toNumber(),
           entryPrice: input.entryPrice.toNumber(),
           investedAmount: input.investedAmount.toNumber(),
+          buyNumber: input.buyNumber,
           orderId,
           fee: fee?.cost,
           feeCurrency: fee?.currency,
-          batchId,
+          cycleId,
         },
       });
 
       logger.info(
         {
           positionId: position.id,
-          batchId,
+          cycleId,
+          buyNumber: input.buyNumber,
           quantity: input.quantity.toString(),
           entryPrice: input.entryPrice.toString(),
           invested: input.investedAmount.toString(),
@@ -102,342 +115,372 @@ export class PositionManagerService {
         'Position created'
       );
 
-      // 2. Recalcular batch
-      await this.recalculateBatchInTransaction(tx, batchId, input.entryPrice);
+      await this.recalculateCycleInTransaction(tx, cycleId, input.entryPrice);
 
       return position;
     });
   }
 
-  /**
-   * Recalcula os valores agregados do batch (preço médio ponderado, targets)
-   */
-  private async recalculateBatchInTransaction(
+  async getOpenPositionCount(cycleId: string): Promise<number> {
+    return prisma.position.count({
+      where: { cycleId, status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } },
+    });
+  }
+
+  // ============================================
+  // RECALCULATE CYCLE
+  // ============================================
+
+  private async recalculateCycleInTransaction(
     tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
-    batchId: string,
-    lastEntryPrice: DecimalType
+    cycleId: string,
+    lastEntryPrice?: DecimalType
   ): Promise<void> {
-    const openPositions = await tx.position.findMany({
-      where: { batchId, status: 'OPEN' },
+    const positions = await tx.position.findMany({
+      where: { cycleId, status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } },
     });
 
-    if (openPositions.length === 0) {
-      return;
-    }
+    if (positions.length === 0) return;
 
-    // Calcular totais
     let totalInvested = new Decimal(0);
     let totalQuantity = new Decimal(0);
+    let remainingQuantity = new Decimal(0);
 
-    for (const pos of openPositions) {
+    for (const pos of positions) {
       totalInvested = totalInvested.plus(pos.investedAmount.toString());
       totalQuantity = totalQuantity.plus(pos.quantity.toString());
+      remainingQuantity = remainingQuantity.plus(pos.remainingQuantity.toString());
     }
 
-    // Preço médio PONDERADO: totalInvested / totalQuantity
-    const averagePrice = totalInvested.dividedBy(totalQuantity);
+    const averagePrice = totalQuantity.isZero()
+      ? new Decimal(0)
+      : totalInvested.dividedBy(totalQuantity);
 
-    // Próximo preço de compra: lastEntryPrice * 0.97
-    const dropPercent = new Decimal(config.DCA_DROP_PERCENT);
-    const nextBuyPrice = lastEntryPrice.times(new Decimal(1).minus(dropPercent));
+    const cycle = await tx.cycle.findUnique({ where: { id: cycleId } });
+    if (!cycle) return;
 
-    // Target de venda: averagePrice * 1.03
-    const profitTarget = new Decimal(config.DCA_PROFIT_TARGET);
+    const gridPercent = new Decimal(cycle.gridPercent.toString());
+    const profitTarget = new Decimal(config.GRID_PROFIT_TARGET);
+
+    const entryPrice = lastEntryPrice ?? averagePrice;
+    const nextBuyPrice = entryPrice.times(new Decimal(1).minus(gridPercent));
     const targetSellPrice = averagePrice.times(new Decimal(1).plus(profitTarget));
 
-    await tx.positionBatch.update({
-      where: { id: batchId },
+    await tx.cycle.update({
+      where: { id: cycleId },
       data: {
         totalQuantity: totalQuantity.toNumber(),
+        remainingQuantity: remainingQuantity.toNumber(),
         totalInvested: totalInvested.toNumber(),
         averagePrice: averagePrice.toNumber(),
         nextBuyPrice: nextBuyPrice.toNumber(),
         targetSellPrice: targetSellPrice.toNumber(),
+        buyCount: positions.length,
       },
     });
 
     logger.info(
       {
-        batchId,
-        positionCount: openPositions.length,
+        cycleId,
+        buyCount: positions.length,
         totalInvested: totalInvested.toString(),
         totalQuantity: totalQuantity.toString(),
         averagePrice: averagePrice.toString(),
         nextBuyPrice: nextBuyPrice.toString(),
         targetSellPrice: targetSellPrice.toString(),
       },
-      'Batch recalculated'
+      'Cycle recalculated'
     );
   }
 
-  /**
-   * Recalcula o batch (versão pública, sem transaction)
-   */
-  async recalculateBatch(batchId: string): Promise<void> {
-    const batch = await prisma.positionBatch.findUnique({
-      where: { id: batchId },
-      include: { positions: { where: { status: 'OPEN' } } },
-    });
-
-    if (!batch || batch.positions.length === 0) {
-      return;
-    }
-
-    const lastPosition = batch.positions[batch.positions.length - 1];
-    const lastEntryPrice = new Decimal(lastPosition.entryPrice.toString());
-
+  async recalculateCycle(cycleId: string): Promise<void> {
     await prisma.$transaction(async (tx) => {
-      await this.recalculateBatchInTransaction(tx, batchId, lastEntryPrice);
+      await this.recalculateCycleInTransaction(tx, cycleId);
     });
   }
 
   // ============================================
-  // SELL LOGIC
+  // PARTIAL SELL (50%)
   // ============================================
 
-  /**
-   * Verifica se deve vender baseado no modo configurado
-   */
-  async checkSellCondition(
-    batch: PositionBatch,
-    currentPrice: DecimalType
-  ): Promise<SellCheckResult> {
-    const sellMode = batch.sellMode;
-
-    switch (sellMode) {
-      case 'BATCH':
-        return this.checkBatchSell(batch, currentPrice);
-      case 'INDIVIDUAL':
-        return this.checkIndividualSell(batch, currentPrice);
-      case 'HYBRID':
-        return this.checkHybridSell(batch, currentPrice);
-      default:
-        return { shouldSell: false, mode: 'none', positionsToSell: [] };
-    }
-  }
-
-  /**
-   * BATCH MODE: Vende todas quando preço >= averagePrice * 1.03
-   */
-  private async checkBatchSell(
-    batch: PositionBatch,
-    currentPrice: DecimalType
-  ): Promise<SellCheckResult> {
-    const targetPrice = new Decimal(batch.targetSellPrice.toString());
-
-    if (currentPrice.lessThan(targetPrice)) {
-      return { shouldSell: false, mode: 'none', positionsToSell: [] };
-    }
-
-    const positions = await prisma.position.findMany({
-      where: { batchId: batch.id, status: 'OPEN' },
-    });
-
-    logger.info(
-      {
-        batchId: batch.id,
-        currentPrice: currentPrice.toString(),
-        targetPrice: targetPrice.toString(),
-        positionCount: positions.length,
-      },
-      'BATCH sell condition met'
-    );
-
-    return {
-      shouldSell: true,
-      mode: 'batch',
-      positionsToSell: positions,
-      reason: `Price ${currentPrice.toString()} >= target ${targetPrice.toString()}`,
-    };
-  }
-
-  /**
-   * INDIVIDUAL MODE: Cada posição com seu target (entryPrice * 1.03)
-   */
-  private async checkIndividualSell(
-    batch: PositionBatch,
-    currentPrice: DecimalType
-  ): Promise<SellCheckResult> {
-    const positions = await prisma.position.findMany({
-      where: { batchId: batch.id, status: 'OPEN' },
-    });
-
-    const profitTarget = new Decimal(config.DCA_PROFIT_TARGET);
-    const positionsToSell: Position[] = [];
-
-    for (const position of positions) {
-      const entryPrice = new Decimal(position.entryPrice.toString());
-      const targetPrice = entryPrice.times(new Decimal(1).plus(profitTarget));
-
-      if (currentPrice.greaterThanOrEqualTo(targetPrice)) {
-        positionsToSell.push(position);
-        logger.debug(
-          {
-            positionId: position.id,
-            entryPrice: entryPrice.toString(),
-            targetPrice: targetPrice.toString(),
-          },
-          'Individual position ready to sell'
-        );
-      }
-    }
-
-    if (positionsToSell.length === 0) {
-      return { shouldSell: false, mode: 'none', positionsToSell: [] };
-    }
-
-    logger.info(
-      {
-        batchId: batch.id,
-        readyCount: positionsToSell.length,
-        totalCount: positions.length,
-      },
-      'INDIVIDUAL sell condition met'
-    );
-
-    return {
-      shouldSell: true,
-      mode: 'individual',
-      positionsToSell,
-      reason: `${positionsToSell.length} positions reached individual targets`,
-    };
-  }
-
-  /**
-   * HYBRID MODE: Prioriza individuais, depois verifica batch
-   */
-  private async checkHybridSell(
-    batch: PositionBatch,
-    currentPrice: DecimalType
-  ): Promise<SellCheckResult> {
-    // Passo 1: Verificar se há posições individuais prontas
-    const individualResult = await this.checkIndividualSell(batch, currentPrice);
-
-    if (individualResult.shouldSell) {
-      return individualResult;
-    }
-
-    // Passo 2: Se não há individuais, verificar batch
-    return this.checkBatchSell(batch, currentPrice);
-  }
-
-  /**
-   * Fecha posições após venda
-   */
-  async closePositions(
-    positions: Position[],
+  async partialClosePositions(
+    cycleId: string,
+    sellPercent: DecimalType,
     exitPrice: DecimalType,
     exitOrderId?: string
   ): Promise<void> {
-    const profitTarget = new Decimal(config.DCA_PROFIT_TARGET);
-
     await prisma.$transaction(async (tx) => {
+      const positions = await tx.position.findMany({
+        where: { cycleId, status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } },
+      });
+
+      for (const position of positions) {
+        const remaining = new Decimal(position.remainingQuantity.toString());
+        const soldQuantity = remaining.times(sellPercent);
+        const newRemaining = remaining.minus(soldQuantity);
+
+        await tx.position.update({
+          where: { id: position.id },
+          data: {
+            remainingQuantity: newRemaining.toNumber(),
+            status: newRemaining.isZero() ? 'CLOSED' : 'PARTIALLY_CLOSED',
+            ...(newRemaining.isZero() ? {
+              exitPrice: exitPrice.toNumber(),
+              exitOrderId,
+              closedAt: new Date(),
+            } : {}),
+          },
+        });
+
+        logger.debug(
+          {
+            positionId: position.id,
+            soldQuantity: soldQuantity.toString(),
+            newRemaining: newRemaining.toString(),
+          },
+          'Position partially closed'
+        );
+      }
+
+      // Update cycle remaining quantity
+      const totalRemaining = positions.reduce(
+        (sum, p) => {
+          const r = new Decimal(p.remainingQuantity.toString());
+          return sum.plus(r.minus(r.times(sellPercent)));
+        },
+        new Decimal(0)
+      );
+
+      await tx.cycle.update({
+        where: { id: cycleId },
+        data: {
+          remainingQuantity: totalRemaining.toNumber(),
+          partialSellDone: true,
+          status: 'PARTIAL_SELL',
+        },
+      });
+    });
+
+    logger.info(
+      { cycleId, sellPercent: sellPercent.toString(), exitPrice: exitPrice.toString() },
+      'Partial close executed'
+    );
+  }
+
+  // ============================================
+  // FULL CLOSE
+  // ============================================
+
+  async fullClosePositions(
+    cycleId: string,
+    exitPrice: DecimalType,
+    exitOrderId?: string
+  ): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+      const positions = await tx.position.findMany({
+        where: { cycleId, status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } },
+      });
+
+      let totalInvested = new Decimal(0);
+      let totalSaleValue = new Decimal(0);
+
       for (const position of positions) {
         const invested = new Decimal(position.investedAmount.toString());
-        const quantity = new Decimal(position.quantity.toString());
-        const saleValue = quantity.times(exitPrice);
+        const remaining = new Decimal(position.remainingQuantity.toString());
+        const saleValue = remaining.times(exitPrice);
         const profit = saleValue.minus(invested);
-        const profitPercent = profit.dividedBy(invested).times(100);
+        const profitPct = invested.isZero() ? new Decimal(0) : profit.dividedBy(invested).times(100);
+
+        totalInvested = totalInvested.plus(invested);
+        totalSaleValue = totalSaleValue.plus(saleValue);
 
         await tx.position.update({
           where: { id: position.id },
           data: {
             status: 'CLOSED',
+            remainingQuantity: 0,
             exitPrice: exitPrice.toNumber(),
             exitOrderId,
             profit: profit.toNumber(),
-            profitPercent: profitPercent.toNumber(),
+            profitPercent: profitPct.toNumber(),
             closedAt: new Date(),
           },
         });
-
-        logger.info(
-          {
-            positionId: position.id,
-            exitPrice: exitPrice.toString(),
-            profit: profit.toString(),
-            profitPercent: profitPercent.toFixed(2) + '%',
-          },
-          'Position closed'
-        );
       }
+
+      const totalProfit = totalSaleValue.minus(totalInvested);
+      const totalProfitPct = totalInvested.isZero()
+        ? new Decimal(0)
+        : totalProfit.dividedBy(totalInvested).times(100);
+
+      await tx.cycle.update({
+        where: { id: cycleId },
+        data: {
+          status: 'COMPLETED',
+          remainingQuantity: 0,
+          totalProfit: totalProfit.toNumber(),
+          profitPercent: totalProfitPct.toNumber(),
+          closedAt: new Date(),
+        },
+      });
+
+      logger.info(
+        {
+          cycleId,
+          totalProfit: totalProfit.toString(),
+          profitPercent: totalProfitPct.toFixed(2) + '%',
+        },
+        'Cycle fully closed'
+      );
     });
   }
 
-  /**
-   * Fecha o batch quando todas as posições foram vendidas
-   */
-  async closeBatchIfEmpty(batchId: string): Promise<boolean> {
-    const openCount = await prisma.position.count({
-      where: { batchId, status: 'OPEN' },
-    });
+  // ============================================
+  // TRAILING STOP
+  // ============================================
 
-    if (openCount > 0) {
-      // Recalcular batch com posições restantes
-      await this.recalculateBatch(batchId);
-      return false;
-    }
+  async activateTrailingStop(
+    cycleId: string,
+    currentPrice: DecimalType,
+    trailingPercent: DecimalType
+  ): Promise<void> {
+    const stopPrice = currentPrice.times(new Decimal(1).minus(trailingPercent));
 
-    await prisma.positionBatch.update({
-      where: { id: batchId },
+    await prisma.cycle.update({
+      where: { id: cycleId },
       data: {
-        status: 'COMPLETED',
-        closedAt: new Date(),
+        status: 'TRAILING',
+        trailingHighPrice: currentPrice.toNumber(),
+        trailingStopPrice: stopPrice.toNumber(),
       },
     });
 
-    logger.info({ batchId }, 'Batch completed (all positions closed)');
-    return true;
+    logger.info(
+      {
+        cycleId,
+        highPrice: currentPrice.toString(),
+        stopPrice: stopPrice.toString(),
+        trailingPercent: trailingPercent.toString(),
+      },
+      'Trailing stop activated'
+    );
+  }
+
+  async updateTrailingStop(
+    cycleId: string,
+    currentPrice: DecimalType
+  ): Promise<{ triggered: boolean; stopPrice: DecimalType }> {
+    const cycle = await prisma.cycle.findUnique({ where: { id: cycleId } });
+    if (!cycle || !cycle.trailingStopPrice || !cycle.trailingHighPrice) {
+      return { triggered: false, stopPrice: new Decimal(0) };
+    }
+
+    const trailingPercent = new Decimal(config.GRID_TRAILING_STOP_PERCENT);
+    let highPrice = new Decimal(cycle.trailingHighPrice.toString());
+    let stopPrice = new Decimal(cycle.trailingStopPrice.toString());
+
+    // Update high watermark
+    if (currentPrice.greaterThan(highPrice)) {
+      highPrice = currentPrice;
+      stopPrice = currentPrice.times(new Decimal(1).minus(trailingPercent));
+
+      await prisma.cycle.update({
+        where: { id: cycleId },
+        data: {
+          trailingHighPrice: highPrice.toNumber(),
+          trailingStopPrice: stopPrice.toNumber(),
+        },
+      });
+
+      logger.debug(
+        {
+          cycleId,
+          newHigh: highPrice.toString(),
+          newStop: stopPrice.toString(),
+        },
+        'Trailing stop moved up'
+      );
+    }
+
+    // Check if triggered
+    if (currentPrice.lessThanOrEqualTo(stopPrice)) {
+      logger.info(
+        {
+          cycleId,
+          currentPrice: currentPrice.toString(),
+          stopPrice: stopPrice.toString(),
+        },
+        'Trailing stop triggered'
+      );
+      return { triggered: true, stopPrice };
+    }
+
+    return { triggered: false, stopPrice };
   }
 
   // ============================================
   // QUERIES
   // ============================================
 
-  /**
-   * Obtém resumo do batch atual
-   */
-  async getBatchSummary(batchId: string, currentPrice?: DecimalType): Promise<BatchSummary | null> {
-    const batch = await prisma.positionBatch.findUnique({
-      where: { id: batchId },
-      include: { positions: { where: { status: 'OPEN' } } },
+  async getCycleSummary(cycleId: string, currentPrice?: DecimalType): Promise<CycleSummary | null> {
+    const cycle = await prisma.cycle.findUnique({
+      where: { id: cycleId },
+      include: { positions: { where: { status: { in: ['OPEN', 'PARTIALLY_CLOSED'] } } } },
     });
 
-    if (!batch) return null;
+    if (!cycle) return null;
 
-    const totalInvested = new Decimal(batch.totalInvested.toString());
-    const totalQuantity = new Decimal(batch.totalQuantity.toString());
-    const averagePrice = new Decimal(batch.averagePrice.toString());
+    const totalInvested = new Decimal(cycle.totalInvested.toString());
+    const remainingQuantity = new Decimal(cycle.remainingQuantity.toString());
 
     let currentPnL: DecimalType | undefined;
     let currentPnLPercent: DecimalType | undefined;
 
-    if (currentPrice && totalQuantity.greaterThan(0)) {
-      const currentValue = totalQuantity.times(currentPrice);
+    if (cycle.status === 'COMPLETED' && cycle.totalProfit !== null) {
+      // Ciclo fechado: usar valores persistidos
+      currentPnL = new Decimal(cycle.totalProfit.toString());
+      currentPnLPercent = cycle.profitPercent
+        ? new Decimal(cycle.profitPercent.toString())
+        : new Decimal(0);
+    } else if (currentPrice && remainingQuantity.greaterThan(0)) {
+      // Ciclo ativo: calcular PnL em tempo real
+      const currentValue = remainingQuantity.times(currentPrice);
       currentPnL = currentValue.minus(totalInvested);
-      currentPnLPercent = currentPnL.dividedBy(totalInvested).times(100);
+      currentPnLPercent = totalInvested.isZero()
+        ? new Decimal(0)
+        : currentPnL.dividedBy(totalInvested).times(100);
     }
 
     return {
-      id: batch.id,
-      symbol: batch.symbol,
-      sellMode: batch.sellMode,
-      status: batch.status,
-      positionCount: batch.positions.length,
+      id: cycle.id,
+      symbol: cycle.symbol,
+      status: cycle.status,
+      buyCount: cycle.buyCount,
+      maxBuys: cycle.maxBuys,
       totalInvested,
-      totalQuantity,
-      averagePrice,
-      nextBuyPrice: new Decimal(batch.nextBuyPrice.toString()),
-      targetSellPrice: new Decimal(batch.targetSellPrice.toString()),
+      totalQuantity: new Decimal(cycle.totalQuantity.toString()),
+      remainingQuantity,
+      averagePrice: new Decimal(cycle.averagePrice.toString()),
+      nextBuyPrice: new Decimal(cycle.nextBuyPrice.toString()),
+      targetSellPrice: new Decimal(cycle.targetSellPrice.toString()),
+      gridPercent: new Decimal(cycle.gridPercent.toString()),
+      partialSellDone: cycle.partialSellDone,
+      trailingStopPrice: cycle.trailingStopPrice ? new Decimal(cycle.trailingStopPrice.toString()) : null,
+      trailingHighPrice: cycle.trailingHighPrice ? new Decimal(cycle.trailingHighPrice.toString()) : null,
       currentPrice,
       currentPnL,
       currentPnLPercent,
     };
   }
 
-  /**
-   * Registra operação no log de trades
-   */
+  async getRecentCompletedCycles(symbol: string, count: number): Promise<Cycle[]> {
+    return prisma.cycle.findMany({
+      where: { symbol, status: 'COMPLETED' },
+      orderBy: { closedAt: 'desc' },
+      take: count,
+    });
+  }
+
   async logTrade(
     symbol: string,
     side: 'buy' | 'sell',
@@ -445,7 +488,7 @@ export class PositionManagerService {
     price: DecimalType,
     cost: DecimalType,
     context: {
-      batchId?: string;
+      cycleId?: string;
       positionId?: string;
       reason?: string;
       orderId?: string;
@@ -460,7 +503,7 @@ export class PositionManagerService {
         price: price.toNumber(),
         cost: cost.toNumber(),
         orderId: context.orderId,
-        batchId: context.batchId,
+        cycleId: context.cycleId,
         positionId: context.positionId,
         reason: context.reason,
         rawResponse: context.rawResponse as object,
@@ -469,5 +512,4 @@ export class PositionManagerService {
   }
 }
 
-// Export singleton
 export const positionManager = new PositionManagerService();
