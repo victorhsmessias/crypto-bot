@@ -229,7 +229,13 @@ export class GridStrategy {
   ): Promise<void> {
     switch (action.type) {
       case 'WAIT':
-        this.logger.info({ reason: action.reason }, 'WAIT');
+        this.logger.info({
+          reason: action.reason,
+          price: currentPrice.toFixed(2),
+          rsi15m: indicators.rsi15m?.toFixed(1) ?? 'N/A',
+          rsi1h: indicators.rsi1h?.toFixed(1) ?? 'N/A',
+          ema200: indicators.ema200_4h?.toFixed(2) ?? 'N/A',
+        }, 'WAIT');
         break;
 
       case 'OPEN_CYCLE':
